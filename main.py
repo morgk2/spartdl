@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 from typing import Optional, List
 from urllib.parse import quote, unquote
+import time
+import threading
 
 app = FastAPI(title="spotDL API", description="API for downloading Spotify tracks and playlists")
 
@@ -56,6 +58,29 @@ task_status = {}
 
 # Store temporary files for direct download
 temp_files = {}
+
+# Cleanup function to remove old temp files
+def cleanup_old_files():
+    """Remove files older than 1 hour from downloads directory"""
+    while True:
+        try:
+            current_time = time.time()
+            for temp_dir in DOWNLOAD_DIR.glob("temp_*"):
+                if temp_dir.is_dir():
+                    # Check directory age
+                    dir_age = current_time - temp_dir.stat().st_mtime
+                    if dir_age > 3600:  # 1 hour
+                        import shutil
+                        shutil.rmtree(temp_dir)
+                        print(f"Cleaned up old temp directory: {temp_dir}")
+        except Exception as e:
+            print(f"Cleanup error: {e}")
+        
+        time.sleep(300)  # Check every 5 minutes
+
+# Start cleanup thread
+cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
+cleanup_thread.start()
 
 @app.get("/")
 async def root():
