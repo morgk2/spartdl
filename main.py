@@ -14,8 +14,8 @@ import threading
 
 app = FastAPI(title="spotDL API", description="API for downloading Spotify tracks and playlists")
 
-# Create downloads directory
-DOWNLOAD_DIR = Path("downloads")
+# Create downloads directory in /tmp (writable on serverless platforms)
+DOWNLOAD_DIR = Path("/tmp/downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 class DownloadRequest(BaseModel):
