@@ -12,6 +12,15 @@ from urllib.parse import quote, unquote
 import time
 import threading
 
+# Set environment variables for spotDL globally (before any imports)
+os.environ["XDG_CACHE_HOME"] = "/tmp/spotdl_cache"
+os.environ["XDG_CONFIG_HOME"] = "/tmp/spotdl_config"
+os.environ["XDG_DATA_HOME"] = "/tmp/spotdl_data"
+
+# Create the directories globally
+for path in ["/tmp/spotdl_cache", "/tmp/spotdl_config", "/tmp/spotdl_data"]:
+    Path(path).mkdir(exist_ok=True)
+
 app = FastAPI(title="spotDL API", description="API for downloading Spotify tracks and playlists")
 
 # Create downloads directory in /tmp (writable on serverless platforms)
@@ -92,15 +101,6 @@ async def get_audio_download_link(request: DownloadRequest, http_request: Reques
     Get direct download link for the audio file (synchronous)
     """
     try:
-        # Set environment variables for spotDL to use /tmp for cache/config
-        os.environ["XDG_CACHE_HOME"] = "/tmp/spotdl_cache"
-        os.environ["XDG_CONFIG_HOME"] = "/tmp/spotdl_config"
-        os.environ["XDG_DATA_HOME"] = "/tmp/spotdl_data"
-        
-        # Create the directories
-        for path in ["/tmp/spotdl_cache", "/tmp/spotdl_config", "/tmp/spotdl_data"]:
-            Path(path).mkdir(exist_ok=True)
-        
         # Create temporary directory
         temp_dir = DOWNLOAD_DIR / f"temp_{str(uuid.uuid4())}"
         temp_dir.mkdir(exist_ok=True)
@@ -125,6 +125,13 @@ async def get_audio_download_link(request: DownloadRequest, http_request: Reques
         )
         
         stdout, stderr = await process.communicate()
+        
+        # Debug logging
+        print(f"spotDL command: {' '.join(cmd)}")
+        print(f"Return code: {process.returncode}")
+        print(f"stdout: {stdout.decode()}")
+        print(f"stderr: {stderr.decode()}")
+        print(f"Temp directory contents: {list(temp_dir.glob('*'))}")
         
         if process.returncode != 0:
             # Clean up temp directory
