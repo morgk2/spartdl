@@ -92,6 +92,15 @@ async def get_audio_download_link(request: DownloadRequest, http_request: Reques
     Get direct download link for the audio file (synchronous)
     """
     try:
+        # Set environment variables for spotDL to use /tmp for cache/config
+        os.environ["XDG_CACHE_HOME"] = "/tmp/spotdl_cache"
+        os.environ["XDG_CONFIG_HOME"] = "/tmp/spotdl_config"
+        os.environ["XDG_DATA_HOME"] = "/tmp/spotdl_data"
+        
+        # Create the directories
+        for path in ["/tmp/spotdl_cache", "/tmp/spotdl_config", "/tmp/spotdl_data"]:
+            Path(path).mkdir(exist_ok=True)
+        
         # Create temporary directory
         temp_dir = DOWNLOAD_DIR / f"temp_{str(uuid.uuid4())}"
         temp_dir.mkdir(exist_ok=True)
