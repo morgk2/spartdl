@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 import os
@@ -87,7 +87,7 @@ async def root():
     return {"message": "spotDL API is running", "version": "1.0.0"}
 
 @app.post("/get/audio-download-link")
-async def get_audio_download_link(request: DownloadRequest):
+async def get_audio_download_link(request: DownloadRequest, http_request: Request):
     """
     Get direct download link for the audio file (synchronous)
     """
@@ -136,9 +136,10 @@ async def get_audio_download_link(request: DownloadRequest):
         
         audio_file = downloaded_files[0]
         
-        # Create a download endpoint URL with URL-encoded filename
+        # Create a download endpoint URL with dynamic domain
+        base_url = str(http_request.base_url).rstrip('/')
         encoded_filename = quote(audio_file.name)
-        download_url = f"http://localhost:8001/temp-download/{encoded_filename}"
+        download_url = f"{base_url}/temp-download/{encoded_filename}"
         
         # Store the file path for temporary access
         temp_files[download_url] = str(audio_file)
