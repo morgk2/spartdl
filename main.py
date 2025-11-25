@@ -23,7 +23,11 @@ url_cache: Dict[str, Dict] = {}
 CACHE_TTL = 3600  # 1 hour cache
 
 # Platform-specific temp directory
-TEMP_BASE = Path(tempfile.gettempdir()) / "spotdl_api"
+# For Railway, use /tmp which is persistent within a deployment
+if os.environ.get("RAILWAY_ENVIRONMENT"):
+    TEMP_BASE = Path("/tmp/spotdl_api")
+else:
+    TEMP_BASE = Path(tempfile.gettempdir()) / "spotdl_api"
 TEMP_BASE.mkdir(exist_ok=True)
 
 # Pre-warm environment variables
@@ -169,6 +173,9 @@ async def get_audio_download_link(request: DownloadRequest, http_request: Reques
         
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+            print(f"DEBUG: spotdl stdout: {stdout.decode()}")
+            print(f"DEBUG: spotdl stderr: {stderr.decode()}")
+            print(f"DEBUG: spotdl return code: {process.returncode}")
         except asyncio.TimeoutError:
             process.kill()
             import shutil
@@ -180,23 +187,53 @@ async def get_audio_download_link(request: DownloadRequest, http_request: Reques
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise HTTPException(status_code=400, detail=f"Download failed: {stderr.decode()}")
         
-        # Find the downloaded file
-        downloaded_files = list(temp_dir.glob(f"*.{request.format}"))
-        if not downloaded_files:
-            downloaded_files = list(temp_dir.glob("*.mp3"))
+        # Find the downloaded file - more robust search
+        downloaded_files = []
+        
+        # Try multiple file patterns
+        for pattern in [f"*.{request.format}", "*.mp3", "*.m4a", "*.ogg", "*.wav"]:
+            files = list(temp_dir.glob(pattern))
+            if files:
+                downloaded_files.extend(files)
+        
+        # Debug: List all files in temp directory
+        all_files = list(temp_dir.glob("*"))
+        print(f"DEBUG: Files in temp_dir {temp_dir}: {[f.name for f in all_files]}")
         
         if not downloaded_files:
             import shutil
             shutil.rmtree(temp_dir, ignore_errors=True)
-            raise HTTPException(status_code=400, detail="No audio file found after download")
+            raise HTTPException(status_code=400, detail=f"No audio file found after download. Files found: {[f.name for f in all_files]}")
         
         audio_file = downloaded_files[0]
         
-        # Cache the result for next time
-        url_cache[cache_key] = {
-            'file_path': str(audio_file),
-            'timestamp': time.time()
-        }
+        # Move file to stable location (important for Railway ephemeral storage)
+        stable_filename = f"{cache_key}_{audio_file.name}"
+        stable_path = DOWNLOAD_DIR / stable_filename
+        
+        try:
+            # Copy file to stable location
+            import shutil
+            shutil.move(str(audio_file), str(stable_path))
+            print(f"DEBUG: Moved file to {stable_path}")
+            
+            # Clean up temp directory
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
+            # Cache the stable path
+            url_cache[cache_key] = {
+                'file_path': str(stable_path),
+                'timestamp': time.time()
+            }
+            audio_file = stable_path
+            
+        except Exception as e:
+            print(f"DEBUG: Failed to move file: {e}")
+            # Fall back to original location
+            url_cache[cache_key] = {
+                'file_path': str(audio_file),
+                'timestamp': time.time()
+            }
         
         # Create download URL
         base_url = str(http_request.base_url).rstrip('/')
