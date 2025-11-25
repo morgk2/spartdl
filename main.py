@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import os
 import uuid
@@ -7,15 +7,36 @@ import asyncio
 from pathlib import Path
 import subprocess
 import tempfile
-from typing import Optional, List
+from typing import Optional, List, Dict
 from urllib.parse import quote, unquote
 import time
 import threading
+import hashlib
+from functools import lru_cache
+import json
+import platform
 
 app = FastAPI(title="spotDL API", description="API for downloading Spotify tracks and playlists")
 
-# Create downloads directory in /tmp (writable on serverless platforms)
-DOWNLOAD_DIR = Path("/tmp/downloads")
+# Cache for download URLs (URL -> {file_path, timestamp})
+url_cache: Dict[str, Dict] = {}
+CACHE_TTL = 3600  # 1 hour cache
+
+# Platform-specific temp directory
+TEMP_BASE = Path(tempfile.gettempdir()) / "spotdl_api"
+TEMP_BASE.mkdir(exist_ok=True)
+
+# Pre-warm environment variables
+os.environ["XDG_CACHE_HOME"] = str(TEMP_BASE / "cache")
+os.environ["XDG_CONFIG_HOME"] = str(TEMP_BASE / "config")
+os.environ["XDG_DATA_HOME"] = str(TEMP_BASE / "data")
+
+# Create cache directories at startup
+for subdir in ["cache", "config", "data"]:
+    (TEMP_BASE / subdir).mkdir(exist_ok=True)
+
+# Create downloads directory (cross-platform compatible)
+DOWNLOAD_DIR = TEMP_BASE / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 class DownloadRequest(BaseModel):
@@ -59,20 +80,29 @@ task_status = {}
 # Store temporary files for direct download
 temp_files = {}
 
-# Cleanup function to remove old temp files
+# Cleanup function to remove old temp files and cache
 def cleanup_old_files():
-    """Remove files older than 1 hour from downloads directory"""
+    """Remove files older than 1 hour from downloads directory and clean cache"""
     while True:
         try:
             current_time = time.time()
+            # Clean old directories
             for temp_dir in DOWNLOAD_DIR.glob("temp_*"):
                 if temp_dir.is_dir():
-                    # Check directory age
                     dir_age = current_time - temp_dir.stat().st_mtime
                     if dir_age > 3600:  # 1 hour
                         import shutil
                         shutil.rmtree(temp_dir)
                         print(f"Cleaned up old temp directory: {temp_dir}")
+            
+            # Clean URL cache
+            expired_keys = []
+            for url, data in url_cache.items():
+                if current_time - data.get('timestamp', 0) > CACHE_TTL:
+                    expired_keys.append(url)
+            for key in expired_keys:
+                del url_cache[key]
+                
         except Exception as e:
             print(f"Cleanup error: {e}")
         
@@ -89,48 +119,66 @@ async def root():
 @app.post("/get/audio-download-link")
 async def get_audio_download_link(request: DownloadRequest, http_request: Request):
     """
-    Get direct download link for the audio file (synchronous)
+    Get direct download link for the audio file (synchronous with caching)
+    Returns immediately if cached, otherwise downloads and returns the link
     """
     try:
-        # Set environment variables for spotDL to use /tmp for cache/config
-        os.environ["XDG_CACHE_HOME"] = "/tmp/spotdl_cache"
-        os.environ["XDG_CONFIG_HOME"] = "/tmp/spotdl_config"
-        os.environ["XDG_DATA_HOME"] = "/tmp/spotdl_data"
+        # Check cache first for instant response
+        cache_key = hashlib.md5(f"{request.spotify_url}_{request.format}_{request.quality}".encode()).hexdigest()
+        if cache_key in url_cache:
+            cached_data = url_cache[cache_key]
+            if time.time() - cached_data['timestamp'] < CACHE_TTL:
+                if os.path.exists(cached_data['file_path']):
+                    # Return cached result INSTANTLY
+                    base_url = str(http_request.base_url).rstrip('/')
+                    filename = Path(cached_data['file_path']).name
+                    download_url = f"{base_url}/temp-download/{quote(filename)}"
+                    temp_files[download_url] = cached_data['file_path']
+                    return {
+                        "spotify_url": request.spotify_url,
+                        "audio_download_url": download_url,
+                        "filename": filename,
+                        "format": request.format,
+                        "quality": request.quality,
+                        "file_size": Path(cached_data['file_path']).stat().st_size,
+                        "cached": True
+                    }
         
-        # Create the directories
-        for path in ["/tmp/spotdl_cache", "/tmp/spotdl_config", "/tmp/spotdl_data"]:
-            Path(path).mkdir(exist_ok=True)
-        
-        # Create temporary directory
+        # Not cached - download it now (with optimizations)
         temp_dir = DOWNLOAD_DIR / f"temp_{str(uuid.uuid4())}"
         temp_dir.mkdir(exist_ok=True)
         
-        # Build spotDL command to download and get file info
+        # HYPER-OPTIMIZED spotDL command for maximum speed
         cmd = [
             "spotdl",
             "download",
             request.spotify_url,
             "--output", str(temp_dir),
-            "--format", request.format
+            "--format", request.format,
+            "--threads", "8",           # 8 concurrent threads
+            "--bitrate", "128k",        # Lower bitrate = faster download
+            "--skip-album-art"          # Skip downloading/embedding album art (saves 2-5 seconds)
         ]
         
-        if request.quality != "best":
-            cmd.extend(["--quality", request.quality])
-        
-        # Run spotDL
+        # Run with timeout
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            process.kill()
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise HTTPException(status_code=408, detail="Download timeout after 2 minutes")
         
         if process.returncode != 0:
-            # Clean up temp directory
             import shutil
-            shutil.rmtree(temp_dir)
-            raise HTTPException(status_code=400, detail=f"Failed to download: {stderr.decode()}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise HTTPException(status_code=400, detail=f"Download failed: {stderr.decode()}")
         
         # Find the downloaded file
         downloaded_files = list(temp_dir.glob(f"*.{request.format}"))
@@ -138,19 +186,21 @@ async def get_audio_download_link(request: DownloadRequest, http_request: Reques
             downloaded_files = list(temp_dir.glob("*.mp3"))
         
         if not downloaded_files:
-            # Clean up temp directory
             import shutil
-            shutil.rmtree(temp_dir)
+            shutil.rmtree(temp_dir, ignore_errors=True)
             raise HTTPException(status_code=400, detail="No audio file found after download")
         
         audio_file = downloaded_files[0]
         
-        # Create a download endpoint URL with dynamic domain
-        base_url = str(http_request.base_url).rstrip('/')
-        encoded_filename = quote(audio_file.name)
-        download_url = f"{base_url}/temp-download/{encoded_filename}"
+        # Cache the result for next time
+        url_cache[cache_key] = {
+            'file_path': str(audio_file),
+            'timestamp': time.time()
+        }
         
-        # Store the file path for temporary access
+        # Create download URL
+        base_url = str(http_request.base_url).rstrip('/')
+        download_url = f"{base_url}/temp-download/{quote(audio_file.name)}"
         temp_files[download_url] = str(audio_file)
         
         return {
@@ -158,9 +208,9 @@ async def get_audio_download_link(request: DownloadRequest, http_request: Reques
             "audio_download_url": download_url,
             "filename": audio_file.name,
             "format": request.format,
-            "quality": request.quality,
+            "quality": "128k",  # Actual bitrate being used for speed
             "file_size": audio_file.stat().st_size,
-            "note": "This download link is temporary and will be available for a short time."
+            "cached": False
         }
         
     except HTTPException:
@@ -171,12 +221,11 @@ async def get_audio_download_link(request: DownloadRequest, http_request: Reques
 @app.get("/temp-download/{filename}")
 async def temp_download_file(filename: str):
     """
-    Serve temporary downloaded files
+    Serve temporary downloaded files with streaming support
     """
-    # Decode the URL-encoded filename
     decoded_filename = unquote(filename)
     
-    # Find the file path
+    # Optimized file lookup using filename
     file_path = None
     for url, path in temp_files.items():
         if decoded_filename in path:
@@ -186,10 +235,12 @@ async def temp_download_file(filename: str):
     if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
     
+    # Use FileResponse with streaming for better performance
     return FileResponse(
         file_path,
         media_type="audio/mpeg",
-        filename=decoded_filename
+        filename=decoded_filename,
+        headers={"Accept-Ranges": "bytes"}  # Enable range requests for streaming
     )
 
 @app.post("/get/download-link")
@@ -460,36 +511,107 @@ async def list_tasks():
     """
     return {"tasks": list(task_status.values())}
 
-async def download_track_background(task_id: str, spotify_url: str, format: str, quality: str, output_file: str = None):
+async def download_audio_link_background(task_id: str, spotify_url: str, format: str, quality: str, base_url: str, cache_key: str):
     """
-    Background task to download a single track
+    Optimized background task for audio download link
     """
     try:
-        # Update status
         task_status[task_id].status = "downloading"
         
-        # Create output directory
-        output_dir = DOWNLOAD_DIR / task_id
-        output_dir.mkdir(exist_ok=True)
+        temp_dir = DOWNLOAD_DIR / f"temp_{str(uuid.uuid4())}"
+        temp_dir.mkdir(exist_ok=True)
         
-        # Build spotDL command
+        # Optimized spotDL command with threading
         cmd = [
             "spotdl",
             "download",
             spotify_url,
-            "--output", str(output_dir)
+            "--output", str(temp_dir),
+            "--format", format,
+            "--threads", "4",  # Enable threading for faster downloads
+            "--simple-tui"      # Reduce overhead from TUI
         ]
-        
-        if format != "mp3":
-            cmd.extend(["--format", format])
         
         if quality != "best":
             cmd.extend(["--quality", quality])
         
+        # Run with timeout to prevent hanging
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)  # 2 min timeout
+        except asyncio.TimeoutError:
+            process.kill()
+            task_status[task_id].status = "failed"
+            task_status[task_id].error = "Download timeout after 2 minutes"
+            return
+        
+        if process.returncode != 0:
+            task_status[task_id].status = "failed"
+            task_status[task_id].error = stderr.decode()
+            import shutil
+            shutil.rmtree(temp_dir)
+            return
+        
+        downloaded_files = list(temp_dir.glob(f"*.{format}"))
+        if not downloaded_files:
+            downloaded_files = list(temp_dir.glob("*.mp3"))
+        
+        if not downloaded_files:
+            task_status[task_id].status = "failed"
+            task_status[task_id].error = "No audio file found"
+            import shutil
+            shutil.rmtree(temp_dir)
+            return
+        
+        audio_file = downloaded_files[0]
+        
+        # Cache the result
+        url_cache[cache_key] = {
+            'file_path': str(audio_file),
+            'timestamp': time.time()
+        }
+        
+        # Create download URL
+        download_url = f"{base_url}/temp-download/{quote(audio_file.name)}"
+        temp_files[download_url] = str(audio_file)
+        
+        task_status[task_id].status = "completed"
+        task_status[task_id].file_path = download_url  # Store the URL instead of file path
+        
+    except Exception as e:
+        task_status[task_id].status = "failed"
+        task_status[task_id].error = str(e)
+
+async def download_track_background(task_id: str, spotify_url: str, format: str, quality: str, output_file: str = None):
+    """
+    Optimized background task to download a single track
+    """
+    try:
+        task_status[task_id].status = "downloading"
+        
+        output_dir = DOWNLOAD_DIR / task_id
+        output_dir.mkdir(exist_ok=True)
+        
+        # Build HYPER-optimized spotDL command
+        cmd = [
+            "spotdl",
+            "download",
+            spotify_url,
+            "--output", str(output_dir),
+            "--format", format,
+            "--threads", "8",
+            "--bitrate", "128k",
+            "--skip-album-art"
+        ]
+        
         if output_file:
             cmd.extend(["--save-file", output_file])
         
-        # Run spotDL
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -503,7 +625,6 @@ async def download_track_background(task_id: str, spotify_url: str, format: str,
             task_status[task_id].error = stderr.decode()
             return
         
-        # Find the downloaded file
         downloaded_files = list(output_dir.glob("*.mp3"))
         if not downloaded_files:
             downloaded_files = list(output_dir.glob("*"))
@@ -521,34 +642,29 @@ async def download_track_background(task_id: str, spotify_url: str, format: str,
 
 async def download_playlist_background(task_id: str, playlist_url: str, format: str, quality: str, output_file: str = None):
     """
-    Background task to download a playlist
+    Optimized background task to download a playlist
     """
     try:
-        # Update status
         task_status[task_id].status = "downloading"
         
-        # Create output directory
         output_dir = DOWNLOAD_DIR / task_id
         output_dir.mkdir(exist_ok=True)
         
-        # Build spotDL command
+        # Build HYPER-optimized spotDL command for playlists
         cmd = [
             "spotdl",
             "download",
             playlist_url,
-            "--output", str(output_dir)
+            "--output", str(output_dir),
+            "--format", format,
+            "--threads", "16",
+            "--bitrate", "128k",
+            "--skip-album-art"
         ]
-        
-        if format != "mp3":
-            cmd.extend(["--format", format])
-        
-        if quality != "best":
-            cmd.extend(["--quality", quality])
         
         if output_file:
             cmd.extend(["--save-file", output_file])
         
-        # Run spotDL
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -562,7 +678,6 @@ async def download_playlist_background(task_id: str, playlist_url: str, format: 
             task_status[task_id].error = stderr.decode()
             return
         
-        # Check if files were downloaded
         downloaded_files = list(output_dir.rglob("*.mp3"))
         if downloaded_files:
             task_status[task_id].status = "completed"
@@ -723,5 +838,26 @@ async def update_metadata_background(task_id: str, file_paths: List[str]):
 if __name__ == "__main__":
     import uvicorn
     import os
+    import platform
+    
     port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    
+    # Optimized Uvicorn configuration (Windows-compatible)
+    config = {
+        "app": app,
+        "host": "0.0.0.0",
+        "port": port,
+        "limit_concurrency": 100,
+        "backlog": 2048
+    }
+    
+    # Use uvloop and workers only on Unix systems
+    if platform.system() != "Windows":
+        config["workers"] = 4
+        config["loop"] = "uvloop"
+        config["http"] = "httptools"
+    else:
+        # Windows: Use default asyncio loop
+        print("⚡ Running on Windows - using default asyncio (uvloop not supported)")
+    
+    uvicorn.run(**config)
