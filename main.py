@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 from typing import Optional, List
+from urllib.parse import quote, unquote
 
 app = FastAPI(title="spotDL API", description="API for downloading Spotify tracks and playlists")
 
@@ -110,8 +111,9 @@ async def get_audio_download_link(request: DownloadRequest):
         
         audio_file = downloaded_files[0]
         
-        # Create a download endpoint URL
-        download_url = f"http://localhost:8000/temp-download/{audio_file.name}"
+        # Create a download endpoint URL with URL-encoded filename
+        encoded_filename = quote(audio_file.name)
+        download_url = f"http://localhost:8001/temp-download/{encoded_filename}"
         
         # Store the file path for temporary access
         temp_files[download_url] = str(audio_file)
@@ -136,10 +138,13 @@ async def temp_download_file(filename: str):
     """
     Serve temporary downloaded files
     """
+    # Decode the URL-encoded filename
+    decoded_filename = unquote(filename)
+    
     # Find the file path
     file_path = None
     for url, path in temp_files.items():
-        if filename in path:
+        if decoded_filename in path:
             file_path = path
             break
     
@@ -149,7 +154,7 @@ async def temp_download_file(filename: str):
     return FileResponse(
         file_path,
         media_type="audio/mpeg",
-        filename=filename
+        filename=decoded_filename
     )
 
 @app.post("/get/download-link")
@@ -682,4 +687,4 @@ async def update_metadata_background(task_id: str, file_paths: List[str]):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)

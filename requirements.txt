@@ -1,6 +1,6 @@
-fastapi==0.104.1
-uvicorn==0.24.0
+fastapi>=0.103.0,<0.104
+uvicorn>=0.23.2,<0.24
 spotdl==4.4.3
 python-multipart==0.0.6
-pydantic==2.5.0
+pydantic>=2.9.2,<3
 aiofiles==23.2.1
